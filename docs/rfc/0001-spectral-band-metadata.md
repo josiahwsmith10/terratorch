@@ -361,14 +361,17 @@ res = resolve_bands(["R", "G", "B"], spec)
 
 ### 6.3 Normalization provenance: registry constants, not transform introspection
 
-`weights.transforms` is a Kornia `AugmentationSequential` callable. Walking its private children
-to extract mean/std would be brittle across Kornia versions and impossible for weights whose
+`weights.transforms` is an opaque callable whose framework has already changed across TorchGeo
+versions (Kornia `AugmentationSequential` in 0.7.x, torchvision `nn.Sequential` in 0.8.x).
+Walking its children to extract mean/std would be brittle and impossible for weights whose
 normalization is expressed differently (SeCo's three chained Normalizes, Satlas' clamp). The
 prototype instead records explicit constants in the per-weight registry — ~5 auditable lines per
-weight — and pins them with a **numerical equivalence test** against the real bound transform
-(§8), so the registry cannot silently drift from TorchGeo. When TorchGeo ships
-`meta['spectral_spec']` (phase 2, §9), the constants live next to the transform definition and
-drift becomes structurally impossible.
+weight — and pins them with a **black-box numerical equivalence test** against the real bound
+transform: constant images are invariant under any resize/crop geometry, so feeding two constant
+tensors through the pipeline recovers its effective per-channel affine exactly, framework- and
+version-independently (§11). The registry cannot silently drift from TorchGeo. When TorchGeo
+ships `meta['spectral_spec']` (phase 2, §9), the constants live next to the transform definition
+and drift becomes structurally impossible.
 
 ## 7. SAR extension: representation-aware specs round-trip today
 
@@ -406,7 +409,10 @@ Prototyped in this branch, all backward-compatible:
 
 1. **ResNet path (#928 fix).** `load_resnet_weights` resolves `pretrained_bands` through
    `spec_for_weights` first, then legacy `get_pretrained_bands` (now catalog-backed and
-   warn-don't-crash on unknown names), then `[]`. The `look_up_table` dict and the five
+   warn-don't-crash on unknown names), then `[]`. The user's `model_bands` are canonicalized
+   through the same catalog — without this, spellings like `"R"` never string-match the
+   canonical pretrained names and every conv1 column is silently xavier-reinitialized, so the
+   KeyError fix alone would only be cosmetic. The `look_up_table` dict and the five
    enum-meta-mutating `weights.meta['bands'] = [...]` overwrites are deleted.
    `["R","G","B"]` against `SENTINEL2_RGB_MOCO` now builds, with R mapped to the B4 checkpoint
    channel (regression-tested at the conv1-weight level, before/after in §11).
@@ -419,7 +425,9 @@ Prototyped in this branch, all backward-compatible:
 3. **DOFA.** `get_wavelengths` resolves bands through the catalog (`BandSpec.wavelength_um` /
    SAR center frequency), fixing the two `waves_list` bugs (old spellings kept as aliases) and
    giving unknown bands a descriptive error; `get_wavelenghts` remains as a deprecated alias.
-4. **ViT/Swin.** Their copy-pasted `get_pretrained_bands` delegate to the same catalog.
+4. **ViT/Swin.** Their copy-pasted `get_pretrained_bands` delegate to the same catalog, and
+   both load paths get the same `spec_for_weights` ladder — the Swin call site was previously
+   fully unguarded (`weights.meta["bands"]` with no fallback at all).
 
 ## 9. Upstreaming plan (two maintainer groups, three phases)
 
@@ -468,19 +476,58 @@ live in a thin shared package or stay vendored in TerraTorch.
 5. Where should per-weight *geometric* expectations (input size 224/256) live? Out of scope
    here, but the same meta-key pattern would work.
 
-## 11. Before / after (issue #928)
+## 11. Before / after (issue #928) — measured on this branch
 
-*(Measured outputs are pasted here in the final section of this RFC as part of the prototype —
-see the regression test `TestIssue928Regression` in `tests/test_torchgeo_resnet.py`.)*
+Regression tests: `TestIssue928Regression` and `TestInputNormalization` in
+`tests/test_torchgeo_resnet.py`; equivalence tests in `tests/test_spectral_torchgeo_specs.py`.
+Environment: torchgeo 0.8.1, torch 2.13 CPU.
 
-**Before** (base commit): building `ssl4eos12_resnet50_sentinel2_rgb_moco` with
-`model_bands=["R","G","B"]`, `pretrained=True` raises
-`KeyError: 'B4'` from `get_pretrained_bands` (`torchgeo_resnet.py:98`) — the un-padded names in
-`SENTINEL2_RGB_MOCO.meta['bands']` miss the padded-only `look_up_table`. (Issue #928 reports the
-same failure class as `KeyError: 'B1'`.)
+**Before** (base commit `8497c0f`) — building the #928 configuration:
 
-**After**: the same call builds successfully; `conv1` checkpoint channels are mapped
-R→B4/G→B3/B→B2 by index (asserted on the weight tensors); the wrapper reports
-`input_normalization.means == (0, 0, 0)`, `stds == (10000, 10000, 10000)`, matching
-`_ssl4eo_s12_transforms_s2_10k` numerically (asserted vs the real `weights.transforms` output);
-opting in via `backbone_apply_input_normalization: true` applies it in `forward`.
+```python
+ssl4eos12_resnet50_sentinel2_rgb_moco(model_bands=["R", "G", "B"], pretrained=True, ...)
+```
+
+```
+  File ".../terratorch/models/backbones/torchgeo_resnet.py", line 796, in load_resnet_weights
+    pretrained_bands = get_pretrained_bands(weights.meta["bands"]) if "bands" in weights.meta else []
+  File ".../terratorch/models/backbones/torchgeo_resnet.py", line 98, in get_pretrained_bands
+    model_bands = [look_up_table[x.split('.')[-1]] for x in model_bands]
+KeyError: 'B4'
+```
+
+(the un-padded names in `SENTINEL2_RGB_MOCO.meta['bands']` miss the padded-only
+`look_up_table`; issue #928 reports the same failure class as `KeyError: 'B1'`.
+Through `EncoderDecoderFactory` the KeyError is additionally masked as
+"The model ssl4eos12_resnet50_sentinel2_rgb_moco could not be instantiated from any source.")
+
+**After** — the same call, through the full `EncoderDecoderFactory` path:
+
+```
+--- build succeeded ---
+encoder type: ResNetEncoderWrapper
+spectral_spec bands: ('RED', 'GREEN', 'BLUE')
+input_normalization means: (0.0, 0.0, 0.0) stds: (10000.0, 10000.0, 10000.0)
+```
+
+with the checkpoint's `conv1` channels actually selected (R→B4 checkpoint channel 0, G→B3,
+B→B2 — asserted at the weight-tensor level, including a reordered-bands variant; previously the
+user's `"R"/"G"/"B"` spellings never string-matched the canonical pretrained names, so even
+without the KeyError every conv1 column would have been silently xavier-reinitialized).
+
+**Normalization preserved** — effective per-channel affine constants extracted from the real
+`weights.transforms` pipelines (black-box, via constant images) vs the registry:
+
+```
+SENTINEL2_ALL_MOCO:  transforms: mean=[0.0]*13,          std=[10000.0]*13
+                     registry:   mean=[0.0]*13,          std=[10000.0]*13
+SENTINEL2_RGB_MOCO:  transforms: mean=[0.0]*3,           std=[10000.0]*3
+                     registry:   mean=[0.0]*3,           std=[10000.0]*3
+SENTINEL1_ALL_MOCO:  transforms: mean=[-12.59, -20.26],  std=[5.26, 5.91]
+                     registry:   mean=[-12.59, -20.26],  std=[5.26, 5.91]
+```
+
+Exact match on all three target weights (also DINO/DECUR variants; pinned in CI by
+`TestNormalizationEquivalenceVsTorchgeo`, which fails if upstream constants ever drift).
+Opting in via `backbone_apply_input_normalization: true` applies `(x − mean)/std` in `forward`,
+asserted equal to manually normalizing then running the plain model.
