@@ -23,6 +23,9 @@ default_cfgs = generate_default_cfgs(
 
 class Embedder(nn.Module):
     default_out_indices = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
+    has_cls_token = True
+    embed_dim = 768
+    depth = 12
 
     def __init__(
         self,
@@ -31,6 +34,7 @@ class Embedder(nn.Module):
         ckpt_path=None,
         bands=["blue", "green", "red", "nir", "swir16", "swir22"],
         out_indices: tuple[int] = default_out_indices,
+        gsd: float = 1.0,
         vpt: bool = False,
         vpt_n_tokens: int | None = None,
         vpt_dropout: float = 0.0,
@@ -41,7 +45,8 @@ class Embedder(nn.Module):
         self.img_size = img_size
         self.num_frames = num_frames
         self.bands = bands
-        self.out_indices = out_indices
+        self.out_indices = tuple(i % self.depth for i in out_indices)
+        self.gsd = gsd
 
         self.datacuber = Datacuber(bands=bands)
 
@@ -103,6 +108,10 @@ class Embedder(nn.Module):
                 state_dict[k] = v
         return state_dict
 
+    @property
+    def out_channels(self) -> list[int]:
+        return [self.embed_dim] * len(self.out_indices)
+
     def forward_features(
         self,
         x: torch.Tensor,
@@ -115,6 +124,29 @@ class Embedder(nn.Module):
         embeddings = self.clay_encoder(datacube)
 
         return [embeddings[i] for i in self.out_indices]
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        time: torch.Tensor | None = None,
+        latlon: torch.Tensor | None = None,
+        waves: torch.Tensor | list[float] | None = None,
+        gsd: float | None = None,
+        **kwargs,
+    ) -> list[Tensor]:
+        """Forward pass compatible with EncoderDecoderFactory.
+
+        All metadata is optional: `waves` defaults to the wavelengths of the bands
+        declared at construction (via the Datacuber), `gsd` to the value given at
+        construction, and `time`/`latlon` to zeros. Any of them can be overridden
+        per batch through named kwargs. Unknown kwargs are ignored.
+        """
+        if waves is not None and not isinstance(waves, torch.Tensor):
+            waves = torch.tensor(waves, dtype=torch.float32, device=x.device)
+        gsd = self.gsd if gsd is None else gsd
+        if isinstance(gsd, torch.Tensor):
+            gsd = gsd.item()
+        return self.forward_features(x, time=time, latlon=latlon, waves=waves, gsd=gsd)
 
     def fake_datacube(self):
         "Generate a fake datacube for model export."
@@ -167,9 +199,25 @@ def _make_clay(variant: str, pretrained: bool, **kwargs):
     return model
 
 
+@TERRATORCH_BACKBONE_REGISTRY.register
 @register_model
 def clay_v1_base(
     pretrained: bool = False,
     **kwargs,
 ) -> Embedder:
+    """Clay v1 base backbone.
+
+    Registered both with timm (legacy `timm_clay_v1_base` path, wrapped by
+    TimmBackboneWrapper) and with TERRATORCH_BACKBONE_REGISTRY, so unprefixed
+    `backbone: clay_v1_base` resolves to a first-class terratorch backbone whose
+    forward accepts metadata kwargs (time/latlon/waves/gsd).
+
+    Band subsetting is handled natively by Clay's wavelength-conditioned patch
+    embedding (waves derived from band names), so select_patch_embed_weights is
+    not applicable here. Accepts both `model_bands` (terratorch spelling) and
+    `bands` (clay spelling).
+    """
+    model_bands = kwargs.pop("model_bands", None)
+    if model_bands is not None and "bands" not in kwargs:
+        kwargs["bands"] = list(model_bands)
     return _make_clay("clay_v1_base", pretrained=pretrained, **kwargs)

@@ -570,5 +570,20 @@ class Datacuber(nn.Module):
         return datacube
 
     def _parse_wavelengths(self, bands, channels):
-        waves = torch.tensor([WAVELENGTHS[band] if band in WAVELENGTHS.keys() else 0.0 for band in bands])
-        return waves
+        if bands is None:
+            msg = (
+                "Cannot derive wavelengths: no bands were declared at construction and no "
+                "`waves` were passed at forward time."
+            )
+            raise ValueError(msg)
+        if len(bands) != channels:
+            msg = f"Number of declared bands ({len(bands)}: {bands}) does not match input channels ({channels})."
+            raise ValueError(msg)
+        # bands may be enum members (e.g. HLSBands); enum hashes never match the str keys
+        # of WAVELENGTHS, so normalize to the underlying value first
+        bands = [getattr(band, "value", band) for band in bands]
+        unknown = [band for band in bands if band not in WAVELENGTHS]
+        if unknown:
+            msg = f"Unknown band(s) {unknown} for clay_v1. Known bands: {sorted(WAVELENGTHS)}."
+            raise ValueError(msg)
+        return torch.tensor([WAVELENGTHS[band] for band in bands])

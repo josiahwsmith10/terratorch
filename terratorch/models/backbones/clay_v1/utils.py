@@ -19,6 +19,11 @@ def posemb_sincos_2d_with_gsd(
     y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
     assert (dim % 4) == 0, "feature dimension must be multiple of 4 for sincos emb"
 
+    # gsd may arrive as a 0-dim/1-element tensor (possibly on GPU); omega is built on CPU,
+    # so coerce to a python float to avoid a cross-device multiplication.
+    if isinstance(gsd, torch.Tensor):
+        gsd = gsd.item()
+
     omega = torch.arange(dim // 4) / (dim // 4 - 1)
     omega = 1.0 / (temperature ** (2 * omega / dim)) * \
         (gsd / 1.0)  # Adjusted for g
@@ -33,10 +38,12 @@ def posemb_sincos_1d(pos, dim, temperature: int = 10000, dtype=torch.float32):
     assert dim % 2 == 0, "Feature dimension must be a multiple of 2 for sincos embedding"
     pos = torch.arange(pos) if isinstance(pos, int) else pos
 
-    omega = torch.arange(dim // 2).to(pos) / (dim // 2 - 1)
+    # omega must be floating point: following pos's dtype would truncate the division to
+    # zero for integer positions (e.g. wavelengths passed as an int tensor).
+    omega = torch.arange(dim // 2, device=pos.device, dtype=torch.float32) / (dim // 2 - 1)
     omega = 1.0 / (temperature**omega)
 
-    scaled_pos = pos[:, None] * omega[None, :]
+    scaled_pos = pos.to(omega.dtype)[:, None] * omega[None, :]
     pe = torch.cat((scaled_pos.sin(), scaled_pos.cos()), dim=1)
 
     return pe.type(dtype)
