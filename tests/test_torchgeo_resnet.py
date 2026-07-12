@@ -411,15 +411,16 @@ class TestLoadResNetWeights:
         gc.collect()
 
     def test_load_weights_without_checkpoint(self):
-        """Test that load_resnet_weights fails when both ckpt_data and weights are None."""
+        """With both ckpt_data and weights None there is nothing to load:
+        the model is returned unchanged (formerly an AttributeError on
+        weights.meta)."""
         model = resnet18(in_chans=3)
         model_bands = ["RED", "GREEN", "BLUE"]
-        
-        # This should fail because the function accesses weights.meta on line 796
-        with pytest.raises(AttributeError):
-            load_resnet_weights(
-                model, model_bands, ckpt_data=None, weights=None
-            )
+
+        loaded_model = load_resnet_weights(
+            model, model_bands, ckpt_data=None, weights=None
+        )
+        assert loaded_model is model
         gc.collect()
 
     def test_load_weights_with_custom_weight_proj(self):
@@ -985,4 +986,183 @@ class TestMultipleModelVariants:
         except Exception:
             # If it fails to download, that's OK - we still covered the branch
             pass
+        gc.collect()
+
+
+class TestIssue928Regression:
+    """Regression tests for https://github.com/IBM/terratorch/issues/928.
+
+    torchgeo weight meta uses un-padded band codes (SENTINEL2_RGB_MOCO ships
+    ['B4', 'B3', 'B2']); the legacy look_up_table only knew padded ones, so
+    get_pretrained_bands raised KeyError during model construction. The bands
+    now resolve through terratorch.spectral, and the checkpoint's conv1
+    columns must actually be selected (not silently xavier-reinitialized).
+    """
+
+    def _fake_rgb_checkpoint(self):
+        """resnet50 state dict whose conv1 columns are recognizable constants:
+        channel 0 (B4/RED) = 4.0, channel 1 (B3/GREEN) = 3.0, channel 2
+        (B2/BLUE) = 2.0."""
+        state_dict = resnet50(in_chans=3).state_dict()
+        conv1 = state_dict["conv1.weight"].clone()
+        for channel, value in enumerate((4.0, 3.0, 2.0)):
+            conv1[:, channel] = value
+        state_dict["conv1.weight"] = conv1
+        return state_dict
+
+    def test_unpadded_meta_bands_no_longer_raise(self):
+        """The exact #928 shape: un-padded meta bands, R/G/B model bands."""
+        from unittest.mock import Mock
+
+        mock_weights = Mock()
+        mock_weights.meta = {"bands": ["B4", "B3", "B2"]}
+        mock_weights.name = Mock()  # not a str: forces the meta-derived path
+        mock_weights.get_state_dict = lambda progress: self._fake_rgb_checkpoint()
+
+        model = resnet50(in_chans=3)
+        loaded = load_resnet_weights(model, ["R", "G", "B"], None, mock_weights)
+        conv1 = loaded.state_dict()["conv1.weight"]
+        # R -> B4 (checkpoint channel 0), G -> B3 (1), B -> B2 (2)
+        assert torch.all(conv1[:, 0] == 4.0)
+        assert torch.all(conv1[:, 1] == 3.0)
+        assert torch.all(conv1[:, 2] == 2.0)
+        gc.collect()
+
+    def test_reordered_model_bands_select_matching_columns(self):
+        from unittest.mock import Mock
+
+        mock_weights = Mock()
+        mock_weights.meta = {"bands": ["B4", "B3", "B2"]}
+        mock_weights.name = Mock()
+        mock_weights.get_state_dict = lambda progress: self._fake_rgb_checkpoint()
+
+        model = resnet50(in_chans=3)
+        loaded = load_resnet_weights(model, ["B", "G", "R"], None, mock_weights)
+        conv1 = loaded.state_dict()["conv1.weight"]
+        # B -> B2 (checkpoint channel 2), G -> B3 (1), R -> B4 (0)
+        assert torch.all(conv1[:, 0] == 2.0)
+        assert torch.all(conv1[:, 1] == 3.0)
+        assert torch.all(conv1[:, 2] == 4.0)
+        gc.collect()
+
+    def test_full_factory_function_with_real_weights_enum(self):
+        """The registry path: the real SENTINEL2_RGB_MOCO enum member, with
+        only the checkpoint download stubbed out."""
+        from unittest.mock import patch
+
+        from torchgeo.models.resnet import ResNet50_Weights
+
+        with patch.object(
+            type(ResNet50_Weights.SENTINEL2_RGB_MOCO),
+            "get_state_dict",
+            lambda self, progress: self._fake(),
+            create=True,
+        ):
+            pass  # patching the enum member method is fiddly; go through kwargs instead
+
+        with tempfile.NamedTemporaryFile(suffix=".pth", delete=False) as tmp:
+            torch.save(self._fake_rgb_checkpoint(), tmp.name)
+            tmp_path = tmp.name
+        try:
+            wrapper = ssl4eos12_resnet50_sentinel2_rgb_moco(
+                model_bands=["R", "G", "B"], pretrained=True, ckpt_data=tmp_path
+            )
+            assert isinstance(wrapper, ResNetEncoderWrapper)
+            conv1 = wrapper.resnet_model.state_dict()["conv1.weight"]
+            assert torch.all(conv1[:, 0] == 4.0)
+            assert torch.all(conv1[:, 1] == 3.0)
+            assert torch.all(conv1[:, 2] == 2.0)
+            # the weight's bound normalization is recovered on the wrapper
+            assert wrapper.spectral_spec is not None
+            assert wrapper.spectral_spec.band_names() == ("RED", "GREEN", "BLUE")
+            assert wrapper.input_normalization.means == (0.0, 0.0, 0.0)
+            assert wrapper.input_normalization.stds == (10000.0, 10000.0, 10000.0)
+        finally:
+            os.unlink(tmp_path)
+        gc.collect()
+
+    def test_weights_enum_meta_not_mutated(self):
+        """The old factory functions overwrote weights.meta['bands'] on the
+        shared enum member (a global side effect). The registry path must
+        leave torchgeo's meta untouched."""
+        from torchgeo.models.resnet import ResNet50_Weights
+
+        original = list(ResNet50_Weights.SENTINEL2_ALL_MOCO.meta["bands"])
+        with tempfile.NamedTemporaryFile(suffix=".pth", delete=False) as tmp:
+            torch.save(resnet50(in_chans=13).state_dict(), tmp.name)
+            tmp_path = tmp.name
+        try:
+            bands = [
+                "COASTAL_AEROSOL", "BLUE", "GREEN", "RED", "RED_EDGE_1",
+                "RED_EDGE_2", "RED_EDGE_3", "NIR_BROAD", "NIR_NARROW",
+                "WATER_VAPOR", "CIRRUS", "SWIR_1", "SWIR_2",
+            ]
+            ssl4eos12_resnet50_sentinel2_all_moco(
+                model_bands=bands, pretrained=True, ckpt_data=tmp_path
+            )
+            assert ResNet50_Weights.SENTINEL2_ALL_MOCO.meta["bands"] == original
+        finally:
+            os.unlink(tmp_path)
+        gc.collect()
+
+
+class TestInputNormalization:
+    """The normalization torchgeo binds to weights, recovered via
+    terratorch.spectral and applied opt-in by ResNetEncoderWrapper."""
+
+    def _build(self, **kwargs):
+        with tempfile.NamedTemporaryFile(suffix=".pth", delete=False) as tmp:
+            torch.save(resnet50(in_chans=2).state_dict(), tmp.name)
+            tmp_path = tmp.name
+        try:
+            wrapper = ssl4eos12_resnet50_sentinel1_all_moco(
+                model_bands=["VV", "VH"], pretrained=True, ckpt_data=tmp_path, **kwargs
+            )
+        finally:
+            os.unlink(tmp_path)
+        return wrapper
+
+    def test_default_off_exposes_but_does_not_apply(self):
+        wrapper = self._build()
+        assert wrapper.input_normalization is not None
+        # SSL4EO-S12 S1: dB-domain stats from torchgeo _ssl4eo_s12_transforms_s1
+        assert wrapper.input_normalization.means == (-12.59, -20.26)
+        assert wrapper.input_normalization.stds == (5.26, 5.91)
+
+        wrapper_plain = self._build()
+        wrapper_plain.load_state_dict(wrapper.state_dict())
+        wrapper.eval(), wrapper_plain.eval()
+        x = torch.randn(1, 2, 224, 224)
+        with torch.no_grad():
+            out_a = wrapper(x)
+            out_b = wrapper_plain(x)
+        for a, b in zip(out_a, out_b):
+            torch.testing.assert_close(a, b)
+        gc.collect()
+
+    def test_opt_in_applies_weight_bound_normalization(self):
+        wrapper_norm = self._build(apply_input_normalization=True)
+        wrapper_plain = self._build()
+        wrapper_plain.load_state_dict(wrapper_norm.state_dict(), strict=False)
+        wrapper_norm.eval(), wrapper_plain.eval()
+
+        x = torch.randn(1, 2, 224, 224) * 5.0 - 15.0  # dB-ish values
+        mean = torch.tensor([-12.59, -20.26]).view(1, 2, 1, 1)
+        std = torch.tensor([5.26, 5.91]).view(1, 2, 1, 1)
+        with torch.no_grad():
+            out_norm = wrapper_norm(x)
+            out_manual = wrapper_plain((x - mean) / std)
+        for a, b in zip(out_norm, out_manual):
+            torch.testing.assert_close(a, b)
+        gc.collect()
+
+    def test_opt_in_without_resolvable_normalization_raises(self):
+        model = resnet50(in_chans=3)
+        with pytest.raises(ValueError, match="apply_input_normalization"):
+            ResNetEncoderWrapper(
+                model,
+                {"layers": (3, 4, 6, 3)},
+                weights=None,
+                apply_input_normalization=True,
+            )
         gc.collect()

@@ -12,6 +12,7 @@ import huggingface_hub
 from torchvision.models._api import Weights, WeightsEnum
 from terratorch.datasets.utils import OpticalBands, SARBands
 from terratorch.models.backbones.select_patch_embed_weights import select_patch_embed_weights
+from terratorch.spectral import canonical_name, resolve_bands, spec_for_weights, translate_bands
 
 from terratorch.registry import TERRATORCH_BACKBONE_REGISTRY
 import torch
@@ -29,11 +30,26 @@ class ResNetEncoderWrapper(nn.Module):
             Forward pass for embeddings with specified indices.
     """
 
-    def __init__(self, resnet_model, resnet_meta, weights=None, out_indices=None) -> None:
+    def __init__(
+        self,
+        resnet_model,
+        resnet_meta,
+        weights=None,
+        out_indices=None,
+        *,
+        model_bands=None,
+        apply_input_normalization: bool = False,
+    ) -> None:
         """
         Args:
             dofa_model (DOFA): The decoder module to be wrapped.
             weights ()
+            model_bands (list | None): Bands the model receives, used to resolve
+                the weight-bound normalization (see ``spectral_spec``).
+            apply_input_normalization (bool): Apply the pretrained weights'
+                normalization ((x - mean) / std, as bound to the torchgeo
+                weights) inside ``forward``. Off by default: inputs are then
+                expected to be normalized upstream, exactly as before.
         """
         super().__init__()
         self.resnet_model = resnet_model
@@ -43,10 +59,41 @@ class ResNetEncoderWrapper(nn.Module):
         self.out_channels = [x['num_chs'] for x in self.resnet_model.feature_info]
         self.resnet_meta['original_out_channels'] = self.out_channels
         self.out_channels = [x for i, x in enumerate(self.out_channels) if (i in self.out_indices) | (i == (len(self.out_channels)-1)) & (-1 in self.out_indices)]
-        
-    
+
+        self.spectral_spec = spec_for_weights(weights)
+        self.input_normalization = None
+        if (
+            model_bands is not None
+            and self.spectral_spec is not None
+            and self.spectral_spec.bands
+            and self.spectral_spec.normalization is not None
+        ):
+            self.input_normalization = resolve_bands(model_bands, self.spectral_spec)
+        self._apply_input_normalization = apply_input_normalization
+        if apply_input_normalization:
+            if self.input_normalization is None:
+                msg = (
+                    "apply_input_normalization=True but no normalization could be "
+                    "resolved: it requires both model_bands and weights with a "
+                    "known SpectralSpec (see terratorch.spectral.spec_for_weights)."
+                )
+                raise ValueError(msg)
+            self.register_buffer(
+                "_norm_mean",
+                torch.tensor(self.input_normalization.means).view(1, -1, 1, 1),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_norm_std",
+                torch.tensor(self.input_normalization.stds).view(1, -1, 1, 1),
+                persistent=False,
+            )
+
     def forward(self, x: List[torch.Tensor], **kwargs) -> torch.Tensor:
-        
+
+        if self._apply_input_normalization:
+            x = (x - self._norm_mean) / self._norm_std
+
         features = self.resnet_model.forward_intermediates(x, intermediates_only=True)
 
         outs = []
@@ -59,25 +106,18 @@ class ResNetEncoderWrapper(nn.Module):
         return outs
         
 
+# Deprecated: superseded by terratorch.spectral (RFC 0001), which also covers
+# torchgeo's un-padded model-side spellings ('B1', 'B8a' — issue #928) and
+# Landsat. Kept only for backward compatibility of this module's public API.
 look_up_table = {
-    "B01": "COASTAL_AEROSOL",
-    "B02": "BLUE",
-    "B03": "GREEN",
-    "B04": "RED",
-    "B05": "RED_EDGE_1",
-    "B06": "RED_EDGE_2",
-    "B07": "RED_EDGE_3",
-    "B08": "NIR_BROAD",
-    "B8A": "NIR_NARROW",
-    "B09": "WATER_VAPOR",
-    "B10": "CIRRUS",
-    "B11": "SWIR_1",
-    "B12": "SWIR_2",
-    "VV": "VV",
-    "VH": "VH",
-    "R": "RED",
-    "G": "GREEN",
-    "B": "BLUE"
+    code: canonical_name(code, sensor=sensor)
+    for code, sensor in [
+        *[(c, "sentinel2") for c in ("B01", "B02", "B03", "B04", "B05", "B06", "B07",
+                                     "B08", "B8A", "B09", "B10", "B11", "B12",
+                                     "R", "G", "B")],
+        ("VV", "sentinel1"),
+        ("VH", "sentinel1"),
+    ]
 }
 
 resnet18_meta = {
@@ -94,10 +134,13 @@ resnet152_meta = {
 
 
 def get_pretrained_bands(model_bands):
+    """Translate torchgeo band spellings to TerraTorch semantic names.
 
-    model_bands = [look_up_table[x.split('.')[-1]] for x in model_bands]
-
-    return model_bands    
+    Backed by the terratorch.spectral catalog: handles padded ('B04') and
+    un-padded ('B4', 'B8a') codes and dotted prefixes ('SENTINEL2.B02'), and
+    warns instead of raising KeyError on unknown names (issue #928).
+    """
+    return translate_bands(model_bands)
 
 
 #### resnet 18
@@ -291,11 +334,14 @@ def ssl4eos12_resnet18_sentinel2_all_moco(model_bands, pretrained = False, ckpt_
         ViTEncoderWrapper
     """
 
+    apply_input_normalization = kwargs.pop("apply_input_normalization", False)
     if "in_chans" not in kwargs: kwargs["in_chans"] = len(model_bands)
     model = resnet18(**kwargs)
     if pretrained:
         model = load_resnet_weights(model, model_bands, ckpt_data, weights)
-    return ResNetEncoderWrapper(model, resnet18_meta, weights, out_indices)
+    return ResNetEncoderWrapper(model, resnet18_meta, weights, out_indices,
+                                model_bands=model_bands,
+                                apply_input_normalization=apply_input_normalization)
 
 
 @TERRATORCH_BACKBONE_REGISTRY.register
@@ -309,11 +355,14 @@ def ssl4eos12_resnet18_sentinel2_rgb_moco(model_bands, pretrained = False, ckpt_
         ViTEncoderWrapper
     """
 
+    apply_input_normalization = kwargs.pop("apply_input_normalization", False)
     if "in_chans" not in kwargs: kwargs["in_chans"] = len(model_bands)
     model = resnet18(**kwargs)
     if pretrained:
         model = load_resnet_weights(model, model_bands, ckpt_data, weights)
-    return ResNetEncoderWrapper(model, resnet18_meta, weights, out_indices)
+    return ResNetEncoderWrapper(model, resnet18_meta, weights, out_indices,
+                                model_bands=model_bands,
+                                apply_input_normalization=apply_input_normalization)
 
 
 @TERRATORCH_BACKBONE_REGISTRY.register
@@ -534,13 +583,14 @@ def ssl4eos12_resnet50_sentinel1_all_decur(model_bands, pretrained = False, ckpt
         ViTEncoderWrapper
     """
 
+    apply_input_normalization = kwargs.pop("apply_input_normalization", False)
     if "in_chans" not in kwargs: kwargs["in_chans"] = len(model_bands)
     model = resnet50(**kwargs)
     if pretrained:
-        if weights is not None:
-            weights.meta['bands'] = ['VV', 'VH']
         model = load_resnet_weights(model, model_bands, ckpt_data, weights)
-    return ResNetEncoderWrapper(model, resnet50_meta, weights, out_indices)
+    return ResNetEncoderWrapper(model, resnet50_meta, weights, out_indices,
+                                model_bands=model_bands,
+                                apply_input_normalization=apply_input_normalization)
 
 @TERRATORCH_BACKBONE_REGISTRY.register
 def ssl4eos12_resnet50_sentinel1_all_moco(model_bands, pretrained = False, ckpt_data: str | None = None,  weights: Weights | None =  ResNet50_Weights.SENTINEL1_ALL_MOCO, out_indices: list | None = None, **kwargs):
@@ -553,13 +603,14 @@ def ssl4eos12_resnet50_sentinel1_all_moco(model_bands, pretrained = False, ckpt_
         ViTEncoderWrapper
     """
 
+    apply_input_normalization = kwargs.pop("apply_input_normalization", False)
     if "in_chans" not in kwargs: kwargs["in_chans"] = len(model_bands)
     model = resnet50(**kwargs)
     if pretrained:
-        if weights is not None:
-            weights.meta['bands'] = ['VV', 'VH']
         model = load_resnet_weights(model, model_bands, ckpt_data, weights)
-    return ResNetEncoderWrapper(model, resnet50_meta, weights, out_indices)
+    return ResNetEncoderWrapper(model, resnet50_meta, weights, out_indices,
+                                model_bands=model_bands,
+                                apply_input_normalization=apply_input_normalization)
 
 @TERRATORCH_BACKBONE_REGISTRY.register
 def ssl4eos12_resnet50_sentinel2_all_decur(model_bands, pretrained = False, ckpt_data: str | None = None,  weights: Weights | None = ResNet50_Weights.SENTINEL2_ALL_DECUR, out_indices: list | None = None, **kwargs):
@@ -572,13 +623,14 @@ def ssl4eos12_resnet50_sentinel2_all_decur(model_bands, pretrained = False, ckpt
         ViTEncoderWrapper
     """
 
+    apply_input_normalization = kwargs.pop("apply_input_normalization", False)
     if "in_chans" not in kwargs: kwargs["in_chans"] = len(model_bands)
     model = resnet50(**kwargs)
     if pretrained:
-        if weights is not None:
-            weights.meta['bands'] = ['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B09', 'B10', 'B11', 'B12']
         model = load_resnet_weights(model, model_bands, ckpt_data, weights)
-    return ResNetEncoderWrapper(model, resnet50_meta, weights, out_indices)
+    return ResNetEncoderWrapper(model, resnet50_meta, weights, out_indices,
+                                model_bands=model_bands,
+                                apply_input_normalization=apply_input_normalization)
 
 @TERRATORCH_BACKBONE_REGISTRY.register
 def ssl4eos12_resnet50_sentinel2_all_dino(model_bands, pretrained = False, ckpt_data: str | None = None,  weights: Weights | None = ResNet50_Weights.SENTINEL2_ALL_DINO, out_indices: list | None = None, **kwargs):
@@ -591,13 +643,14 @@ def ssl4eos12_resnet50_sentinel2_all_dino(model_bands, pretrained = False, ckpt_
         ViTEncoderWrapper
     """
 
+    apply_input_normalization = kwargs.pop("apply_input_normalization", False)
     if "in_chans" not in kwargs: kwargs["in_chans"] = len(model_bands)
     model = resnet50(**kwargs)
     if pretrained:
-        if weights is not None:
-            weights.meta['bands'] = ['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B09', 'B10', 'B11', 'B12']
         model = load_resnet_weights(model, model_bands, ckpt_data, weights)
-    return ResNetEncoderWrapper(model, resnet50_meta, weights, out_indices)
+    return ResNetEncoderWrapper(model, resnet50_meta, weights, out_indices,
+                                model_bands=model_bands,
+                                apply_input_normalization=apply_input_normalization)
 
 @TERRATORCH_BACKBONE_REGISTRY.register
 def ssl4eos12_resnet50_sentinel2_all_moco(model_bands, pretrained = False, ckpt_data: str | None = None,  weights: Weights | None = ResNet50_Weights.SENTINEL2_ALL_MOCO, out_indices: list | None = None, **kwargs):
@@ -610,13 +663,14 @@ def ssl4eos12_resnet50_sentinel2_all_moco(model_bands, pretrained = False, ckpt_
         ViTEncoderWrapper
     """
 
+    apply_input_normalization = kwargs.pop("apply_input_normalization", False)
     if "in_chans" not in kwargs: kwargs["in_chans"] = len(model_bands)
     model = resnet50(**kwargs)
     if pretrained:
-        if weights is not None:
-            weights.meta['bands'] = ['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B09', 'B10', 'B11', 'B12']
         model = load_resnet_weights(model, model_bands, ckpt_data, weights)
-    return ResNetEncoderWrapper(model, resnet50_meta, weights, out_indices)
+    return ResNetEncoderWrapper(model, resnet50_meta, weights, out_indices,
+                                model_bands=model_bands,
+                                apply_input_normalization=apply_input_normalization)
 
 @TERRATORCH_BACKBONE_REGISTRY.register
 def ssl4eos12_resnet50_sentinel2_rgb_moco(model_bands, pretrained = False, ckpt_data: str | None = None,  weights: Weights | None = ResNet50_Weights.SENTINEL2_RGB_MOCO, out_indices: list | None = None, **kwargs):
@@ -629,11 +683,14 @@ def ssl4eos12_resnet50_sentinel2_rgb_moco(model_bands, pretrained = False, ckpt_
         ViTEncoderWrapper
     """
 
+    apply_input_normalization = kwargs.pop("apply_input_normalization", False)
     if "in_chans" not in kwargs: kwargs["in_chans"] = len(model_bands)
     model = resnet50(**kwargs)
     if pretrained:
         model = load_resnet_weights(model, model_bands, ckpt_data, weights)
-    return ResNetEncoderWrapper(model, resnet50_meta, weights, out_indices)
+    return ResNetEncoderWrapper(model, resnet50_meta, weights, out_indices,
+                                model_bands=model_bands,
+                                apply_input_normalization=apply_input_normalization)
 
 @TERRATORCH_BACKBONE_REGISTRY.register
 def seco_resnet50_sentinel2_rgb_seco(model_bands, pretrained = False, ckpt_data: str | None = None,  weights: Weights | None = ResNet50_Weights.SENTINEL2_RGB_SECO, out_indices: list | None = None, **kwargs):
@@ -792,8 +849,17 @@ def satlas_resnet152_sentinel2_si_rgb_satlas(model_bands, pretrained = False, ck
 
 #### to add build model and load weights
 def load_resnet_weights(model: nn.Module, model_bands, ckpt_data: str, weights: Weights, input_size: int = 224, custom_weight_proj: str = "conv1.weight") -> nn.Module:
-    
-    pretrained_bands = get_pretrained_bands(weights.meta["bands"]) if "bands" in weights.meta else []
+
+    spec = spec_for_weights(weights)
+    if spec is not None and spec.bands:
+        pretrained_bands = list(spec.band_names())
+    elif weights is not None and "bands" in getattr(weights, "meta", {}):
+        pretrained_bands = get_pretrained_bands(weights.meta["bands"])
+    else:
+        pretrained_bands = []
+    # canonicalize the user's bands too, so spellings like "R"/"B4"/enum
+    # members match the canonical pretrained names during weight selection
+    model_bands = translate_bands(model_bands)
     if ckpt_data is not None:
         if ckpt_data.find("https://hf.co/") > -1:
             repo_id = ckpt_data.split("/resolve/")[0].replace("https://hf.co/", '')
