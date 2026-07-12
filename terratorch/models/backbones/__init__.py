@@ -12,10 +12,17 @@ import terratorch.models.backbones.torchgeo_resnet
 import terratorch.models.backbones.torchgeo_swin_satlas
 import terratorch.models.backbones.torchgeo_vit
 import terratorch.models.backbones.mmearth_convnextv2
+import terratorch.models.backbones.galileo
 from terratorch.models.backbones.unet import UNet
 import terratorch.models.backbones.identity_backbone
 
 try:
     import terratorch.models.backbones.heliofm_register
+except ImportError:
+    pass
+
+try:
+    # requires the optional olmoearth-pretrain-minimal dependency (terratorch[olmoearth])
+    import terratorch.models.backbones.olmoearth_register
 except ImportError:
     pass

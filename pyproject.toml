@@ -102,8 +102,14 @@ test = [
   "h5netcdf",
   "geobenchv2>=0.9",
   "terratorch-surya>=0.1.0",
+  "olmoearth-pretrain-minimal>=0.0.6,<0.1; python_version >= '3.11'",
 #  "PrithviWxC",  # Currently fails of pypi version conflics
 #  "granitewxc",  # Currently fails of pypi version conflics
+]
+
+olmoearth = [
+  # requires Python >= 3.11 and torch >= 2.7
+  "olmoearth-pretrain-minimal>=0.0.6,<0.1",
 ]
 
 surya = [
