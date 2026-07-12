@@ -12,6 +12,7 @@ import huggingface_hub
 from torchvision.models._api import Weights, WeightsEnum
 import torch
 from terratorch.models.backbones.select_patch_embed_weights import select_patch_embed_weights
+from terratorch.spectral import canonical_name, spec_for_weights, translate_bands
 
 from terratorch.registry import TERRATORCH_BACKBONE_REGISTRY
 
@@ -43,32 +44,28 @@ class ViTEncoderWrapper(nn.Module):
     def forward(self, x: List[torch.Tensor]) -> torch.Tensor:
         return self.vit_model.forward_intermediates(x, intermediates_only=True)
         
+# Deprecated: superseded by terratorch.spectral (RFC 0001), which also covers
+# torchgeo's un-padded model-side spellings ('B1', 'B8a' — issue #928) and
+# Landsat. Kept only for backward compatibility of this module's public API.
 look_up_table = {
-    "B01": "COASTAL_AEROSOL",
-    "B02": "BLUE",
-    "B03": "GREEN",
-    "B04": "RED",
-    "B05": "RED_EDGE_1",
-    "B06": "RED_EDGE_2",
-    "B07": "RED_EDGE_3",
-    "B08": "NIR_BROAD",
-    "B8A": "NIR_NARROW",
-    "B09": "WATER_VAPOR",
-    "B10": "CIRRUS",
-    "B11": "SWIR_1",
-    "B12": "SWIR_2",
-    "VV": "VV",
-    "VH": "VH",
-    "R": "RED",
-    "G": "GREEN",
-    "B": "BLUE"
+    code: canonical_name(code, sensor=sensor)
+    for code, sensor in [
+        *[(c, "sentinel2") for c in ("B01", "B02", "B03", "B04", "B05", "B06", "B07",
+                                     "B08", "B8A", "B09", "B10", "B11", "B12",
+                                     "R", "G", "B")],
+        ("VV", "sentinel1"),
+        ("VH", "sentinel1"),
+    ]
 }
 
 def get_pretrained_bands(model_bands):
+    """Translate torchgeo band spellings to TerraTorch semantic names.
 
-    model_bands = [look_up_table[x.split('.')[-1]] for x in model_bands]
-
-    return model_bands    
+    Backed by the terratorch.spectral catalog: handles padded ('B04') and
+    un-padded ('B4', 'B8a') codes and dotted prefixes ('SENTINEL2.B02'), and
+    warns instead of raising KeyError on unknown names (issue #928).
+    """
+    return translate_bands(model_bands)
 
 vit_s_meta = {
     'patch_size': 16, 
@@ -270,7 +267,14 @@ def ssl4eos12_vit_small_patch16_224_sentinel2_all_moco(model_bands, pretrained =
 #### to add build model and load weights
 def load_vit_weights(model: nn.Module, model_bands, ckpt_data: str, weights: Weights, input_size: int = 224, custom_weight_proj: str = "patch_embed.proj.weight") -> nn.Module:
     
-    pretrained_bands = get_pretrained_bands(weights.meta["bands"]) if "bands" in weights.meta else ["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B09", "B10", "B11", "B12"]
+    spec = spec_for_weights(weights)
+    if spec is not None and spec.bands:
+        pretrained_bands = list(spec.band_names())
+    elif weights is not None and "bands" in getattr(weights, "meta", {}):
+        pretrained_bands = get_pretrained_bands(weights.meta["bands"])
+    else:
+        pretrained_bands = get_pretrained_bands(["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B09", "B10", "B11", "B12"])
+    model_bands = translate_bands(model_bands)
 
     print("Loading weights")
     if ckpt_data is not None:
