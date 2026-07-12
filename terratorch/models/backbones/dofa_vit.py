@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 import torchgeo.models.dofa as dofa
 import logging
+import warnings
 import math
 import pdb
 from collections.abc import Callable
@@ -17,7 +18,13 @@ from torchgeo.models import dofa
 from torchvision.models._api import Weights, WeightsEnum
 
 from terratorch.registry import TERRATORCH_BACKBONE_REGISTRY
+from terratorch.spectral import canonicalize_band, spec_for_weights
 
+# Deprecated: superseded by terratorch.spectral (RFC 0001). Kept only for
+# backward compatibility of this module's public API; get_wavelengths now
+# resolves through the catalog, which uses torchgeo's authoritative
+# Sentinel-2 wavelengths (differing from these hand-rounded values by at
+# most 0.005 um) and fixes the "THERMAL_INFRARED_12" / "VV-VH" key typos.
 waves_list = {
     "COASTAL_AEROSOL": 0.44,
     "BLUE": 0.49,
@@ -130,6 +137,7 @@ class DOFAEncoderWrapper(nn.Module):
         self.dofa_model = dofa_model
         self.weights = weights
         self.wavelengths = wavelengths
+        self.spectral_spec = spec_for_weights(weights)
 
         self.out_indices = out_indices if out_indices else [-1]
         self.out_channels = [self.dofa_model.patch_embed.embed_dim] * len(self.out_indices)
@@ -156,17 +164,46 @@ class DOFAEncoderWrapper(nn.Module):
         return tuple(outs)
 
 
-def get_wavelenghts(model_bands: list[str]) -> list[float]:
+def get_wavelengths(model_bands: list[str]) -> list[float]:
     """Extract wavelength values for given spectral bands.
 
+    Resolves through the terratorch.spectral catalog: optical bands report
+    their center wavelength in micrometers (torchgeo's authoritative
+    Sentinel-2 values); SAR bands report the carrier frequency in GHz (5.405
+    for Sentinel-1), which is DOFA's established convention.
+
     Args:
-        model_bands: List of band names (e.g., ['RED', 'NIR', 'SWIR_1'])
+        model_bands: List of band names (e.g., ['RED', 'NIR_NARROW', 'SWIR_1'])
 
     Returns:
         List of corresponding wavelength values in micrometers
+
+    Raises:
+        ValueError: If a band is unknown or has no wavelength representation.
     """
-    wavelengths = [waves_list[x.split(".")[-1]] for x in model_bands]
+    wavelengths = []
+    for band in model_bands:
+        spec = canonicalize_band(band)
+        wavelength = spec.dofa_wavelength_um if spec is not None else None
+        if wavelength is None:
+            msg = (
+                f"Band {band!r} has no known wavelength for DOFA. Known bands "
+                "are listed in terratorch.spectral.SENSORS; pass a recognized "
+                "band name or sensor code (e.g. 'RED', 'B04', 'VV')."
+            )
+            raise ValueError(msg)
+        wavelengths.append(wavelength)
     return wavelengths
+
+
+def get_wavelenghts(model_bands: list[str]) -> list[float]:
+    """Deprecated misspelled alias of :func:`get_wavelengths`."""
+    warnings.warn(
+        "get_wavelenghts is deprecated (typo); use get_wavelengths instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return get_wavelengths(model_bands)
 
 
 @TERRATORCH_BACKBONE_REGISTRY.register
@@ -184,7 +221,7 @@ def dofa_small_patch16_224(
     input_size = kwargs["img_size"] if "img_size" in kwargs else 224
     if pretrained:
         model = load_dofa_weights(model, pos_interpolation_mode, ckpt_data, weights, input_size)
-    wavelengths = get_wavelenghts(model_bands)
+    wavelengths = get_wavelengths(model_bands)
 
     return DOFAEncoderWrapper(model, wavelengths, weights, out_indices)
 
@@ -203,7 +240,7 @@ def dofa_base_patch16_224(
     input_size = kwargs["img_size"] if "img_size" in kwargs else 224
     if pretrained:
         model = load_dofa_weights(model, pos_interpolation_mode, ckpt_data, weights, input_size)
-    wavelengths = get_wavelenghts(model_bands)
+    wavelengths = get_wavelengths(model_bands)
 
     return DOFAEncoderWrapper(model, wavelengths, weights, out_indices)
 
@@ -222,7 +259,7 @@ def dofa_large_patch16_224(
     input_size = kwargs["img_size"] if "img_size" in kwargs else 224
     if pretrained:
         model = load_dofa_weights(model, pos_interpolation_mode, ckpt_data, weights, input_size)
-    wavelengths = get_wavelenghts(model_bands)
+    wavelengths = get_wavelengths(model_bands)
 
     return DOFAEncoderWrapper(model, wavelengths, weights, out_indices)
 
