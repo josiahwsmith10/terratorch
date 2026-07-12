@@ -142,11 +142,9 @@ def test_create_pixelwise_model_resnet(backbone, task, expected, decoder, model_
 
     gc.collect()
 
-@pytest.mark.skip("Skip these tests for now.")
-#@pytest.mark.parametrize("backbone", ["dofa_large_patch16_224"])
 @pytest.mark.parametrize("backbone", ["dofa_base_patch16_224"])
 @pytest.mark.parametrize("task,expected", PIXELWISE_TASK_EXPECTED_OUTPUT)
-@pytest.mark.parametrize("decoder", ["IdentityDecoder"])
+@pytest.mark.parametrize("decoder", ["UperNetDecoder"])
 def test_create_pixelwise_model_dofa(backbone, task, expected, decoder, model_factory: EncoderDecoderFactory, model_input):
     model_args = {
         "task": task,
@@ -154,13 +152,12 @@ def test_create_pixelwise_model_dofa(backbone, task, expected, decoder, model_fa
         "decoder": decoder,
         "backbone_model_bands": PRETRAINED_BANDS,
         "backbone_pretrained": False,
-        "backbone_out_indices":  [1, 2, 3, 4] #[5, 11, 17, 23]
+        "backbone_out_indices": [2, 5, 8, 11],
+        "necks": VIT_UPERNET_NECK,
     }
 
     if task == "segmentation":
         model_args["num_classes"] = NUM_CLASSES
-        
-    model_args["necks"] = [{"name": "ReshapeTokensToImage"}]
 
     model = model_factory.build_model(**model_args)
     model.eval()

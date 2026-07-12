@@ -1,20 +1,14 @@
 # reference torchgeo https://torchgeo.readthedocs.io/en/latest/_modules/torchgeo/models/dofa.html#DOFA
-import torch
-import torch.nn.functional as F
-import torchgeo.models.dofa as dofa
 import logging
 import math
-import pdb
-from collections.abc import Callable
-from functools import partial
-from typing import List
+import warnings
 
 import huggingface_hub
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torchgeo.models import dofa
-from torchvision.models._api import Weights, WeightsEnum
+from torchvision.models._api import Weights
 
 from terratorch.registry import TERRATORCH_BACKBONE_REGISTRY
 
@@ -69,7 +63,7 @@ def resize(
         if size is not None and align_corners:
             input_h, input_w = tuple(int(x) for x in input.shape[2:])
             output_h, output_w = tuple(int(x) for x in size)
-            if output_h > input_h or output_w > output_h:
+            if output_h > input_h or output_w > input_w:
                 if (
                     (output_h > 1 and output_w > 1 and input_h > 1 and input_w > 1)
                     and (output_h - 1) % (input_h - 1)
@@ -116,26 +110,37 @@ class DOFAEncoderWrapper(nn.Module):
     Attributes:
         dofa_model (DOFA): The instantiated dofa model
     Methods:
-        forward(x: List[torch.Tensor], wavelengths: list[float]) -> torch.Tensor:
-            Forward pass for embeddings with specified indices.
+        forward(x: torch.Tensor, **kwargs) -> list[torch.Tensor]:
+            Forward pass returning token embeddings for the specified indices.
     """
+
+    has_cls_token = True
 
     def __init__(self, dofa_model, wavelengths, weights=None, out_indices=None) -> None:
         """
         Args:
-            dofa_model (DOFA): The decoder module to be wrapped.
-            weights ()
+            dofa_model (DOFA): The dofa model to be wrapped.
+            wavelengths (list[float]): Wavelength (in micrometers) per input band. Derived
+                from the band names passed as `model_bands`. Band subsetting is handled
+                natively by DOFA's wavelength-conditioned patch embedding, so
+                select_patch_embed_weights is not applicable here.
+            weights: The pretrained weights enum used (informational).
+            out_indices (list[int] | None): Indices of transformer blocks whose token
+                outputs are returned. Defaults to [-1] (last block).
         """
         super().__init__()
         self.dofa_model = dofa_model
         self.weights = weights
         self.wavelengths = wavelengths
 
-        self.out_indices = out_indices if out_indices else [-1]
+        n_blocks = len(self.dofa_model.blocks)
+        out_indices = out_indices if out_indices else [-1]
+        self.out_indices = [i % n_blocks for i in out_indices]
         self.out_channels = [self.dofa_model.patch_embed.embed_dim] * len(self.out_indices)
 
-    def forward(self, x: list[torch.Tensor], **kwargs) -> torch.Tensor:
-        wavelist = torch.tensor(self.wavelengths, device=x.device).float()
+    def forward(self, x: torch.Tensor, **kwargs) -> list[torch.Tensor]:
+        wavelengths = kwargs.get("wavelengths", self.wavelengths)
+        wavelist = torch.tensor(wavelengths, device=x.device).float()
 
         x, _ = self.dofa_model.patch_embed(x, wavelist)
         x = x + self.dofa_model.pos_embed[:, 1:, :]
@@ -150,10 +155,8 @@ class DOFAEncoderWrapper(nn.Module):
             x = block(x)
             if i in self.out_indices:
                 outs.append(x)
-            elif (i == (len(self.dofa_model.blocks) - 1)) & (-1 in self.out_indices):
-                outs.append(x)
 
-        return tuple(outs)
+        return outs
 
 
 def get_wavelenghts(model_bands: list[str]) -> list[float]:
